@@ -188,6 +188,8 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
     let isCancelled = false;
     setCepStatus('loading');
     const fetchAddress = async () => {
+      let foundAddress = false;
+
       try {
         const viaCepResponse = await fetch(`https://viacep.com.br/ws/${cepDigits}/json/`);
         if (viaCepResponse.ok) {
@@ -199,10 +201,17 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
             setCidade(viaCepData.localidade ?? '');
             setEstado(viaCepData.uf ?? '');
             setCepStatus('success');
+            foundAddress = true;
             return;
           }
         }
+      } catch {
+        // ViaCEP indisponível: tenta o fallback abaixo.
+      }
 
+      if (foundAddress) return;
+
+      try {
         const brasilApiResponse = await fetch(`https://brasilapi.com.br/api/cep/v1/${cepDigits}`);
         if (!brasilApiResponse.ok) {
           throw new Error('CEP não encontrado');
