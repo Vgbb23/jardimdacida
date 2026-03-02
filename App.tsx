@@ -187,26 +187,39 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
 
     let isCancelled = false;
     setCepStatus('loading');
-
-    fetch(`https://viacep.com.br/ws/${cepDigits}/json/`)
-      .then((response) => response.json())
-      .then((data) => {
-        if (isCancelled) return;
-
-        if (data?.erro) {
-          setCepStatus('error');
-          return;
+    const fetchAddress = async () => {
+      try {
+        const viaCepResponse = await fetch(`https://viacep.com.br/ws/${cepDigits}/json/`);
+        if (viaCepResponse.ok) {
+          const viaCepData = await viaCepResponse.json();
+          if (!viaCepData?.erro) {
+            if (isCancelled) return;
+            setLogradouro(viaCepData.logradouro ?? '');
+            setBairro(viaCepData.bairro ?? '');
+            setCidade(viaCepData.localidade ?? '');
+            setEstado(viaCepData.uf ?? '');
+            setCepStatus('success');
+            return;
+          }
         }
 
-        setLogradouro(data.logradouro ?? '');
-        setBairro(data.bairro ?? '');
-        setCidade(data.localidade ?? '');
-        setEstado(data.uf ?? '');
+        const brasilApiResponse = await fetch(`https://brasilapi.com.br/api/cep/v1/${cepDigits}`);
+        if (!brasilApiResponse.ok) {
+          throw new Error('CEP não encontrado');
+        }
+        const brasilApiData = await brasilApiResponse.json();
+        if (isCancelled) return;
+        setLogradouro(brasilApiData.street ?? '');
+        setBairro(brasilApiData.neighborhood ?? '');
+        setCidade(brasilApiData.city ?? '');
+        setEstado(brasilApiData.state ?? '');
         setCepStatus('success');
-      })
-      .catch(() => {
+      } catch {
         if (!isCancelled) setCepStatus('error');
-      });
+      }
+    };
+
+    void fetchAddress();
 
     return () => {
       isCancelled = true;
