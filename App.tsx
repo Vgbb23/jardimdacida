@@ -30,6 +30,74 @@ import {
   CreditCard
 } from 'lucide-react';
 
+const POLL_ORDER_MS = 200;
+const REDIRECT_AFTER_PAID_MS = 1200;
+const DEFAULT_POST_PAYMENT_URL = 'https://upselljardim.vercel.app/';
+
+function normalizePhoneForUpsell(phoneValue: string): string {
+  const digits = phoneValue.replace(/\D/g, '');
+  return digits.startsWith('55') ? digits : `55${digits}`;
+}
+
+function encodeUpsellCustomerPrefill(payload: { n: string; e: string; p: string; c: string }): string {
+  const raw = JSON.stringify(payload);
+  return btoa(unescape(encodeURIComponent(raw)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function isFruitfyOrderPaid(orderResponse: unknown): boolean {
+  if (orderResponse == null || typeof orderResponse !== 'object') return false;
+  const r = orderResponse as Record<string, unknown>;
+
+  const hasPaidAt = (o: unknown): boolean => {
+    if (o == null || typeof o !== 'object') return false;
+    const v = (o as Record<string, unknown>).paid_at;
+    return v != null && String(v).trim() !== '';
+  };
+
+  const isPaidStatus = (o: unknown): boolean => {
+    if (o == null || typeof o !== 'object') return false;
+    const s = (o as Record<string, unknown>).status;
+    return typeof s === 'string' && s.trim().toLowerCase() === 'paid';
+  };
+
+  const check = (o: unknown) => hasPaidAt(o) || isPaidStatus(o);
+
+  if (check(r)) return true;
+
+  const data = r.data;
+  if (data != null && typeof data === 'object') {
+    const d = data as Record<string, unknown>;
+    if (check(d)) return true;
+    if (d.data != null && typeof d.data === 'object' && check(d.data)) return true;
+    if (d.order != null && typeof d.order === 'object' && check(d.order)) return true;
+  }
+
+  if (r.order != null && typeof r.order === 'object' && check(r.order)) return true;
+
+  return false;
+}
+
+function extractPixOrderIdFromFruitfy(result: Record<string, unknown>): string {
+  const data = (result?.data ?? result) as Record<string, unknown>;
+  const pick = (o: unknown): string => {
+    if (!o || typeof o !== 'object') return '';
+    const x = o as Record<string, unknown>;
+    for (const k of ['order_uuid', 'uuid', 'order_id', 'id']) {
+      const v = x[k];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return '';
+  };
+  return (
+    pick(data) ||
+    (data?.order && typeof data.order === 'object' ? pick(data.order) : '') ||
+    pick(result)
+  );
+}
+
 // --- Helper Components ---
 
 const Ticker = () => {
@@ -86,9 +154,11 @@ type CartKitItem = { kit: CheckoutKit; quantity: number };
 interface CheckoutModalProps {
   kit: CheckoutKit;
   onClose: () => void;
+  /** Query de rastreio (UTMs etc.) — mesclada no redirect pós-PIX. */
+  trackingQueryString: string;
 }
 
-const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
+const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose, trackingQueryString }) => {
   const [selectedFrete, setSelectedFrete] = useState<'correios' | 'jalog' | 'gratis'>(kit === 'dobro' ? 'gratis' : 'jalog');
   const [nome, setNome] = useState('');
   const [email, setEmail] = useState('');
@@ -119,6 +189,9 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
   const [countdownSeconds, setCountdownSeconds] = useState(12 * 60 + 54);
   const [copied, setCopied] = useState(false);
   const [pedidoConfirmado, setPedidoConfirmado] = useState(false);
+  const [pixOrderId, setPixOrderId] = useState('');
+  const [pagamentoAprovadoRedirect, setPagamentoAprovadoRedirect] = useState(false);
+  const hasRedirectedAfterPayment = useRef(false);
 
   const formatCep = (value: string) => {
     const digits = value.replace(/\D/g, '').slice(0, 8);
@@ -281,6 +354,106 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
     }
   }, [isKitDobro]);
 
+  useEffect(() => {
+    if (!pedidoConfirmado || !pixOrderId || hasRedirectedAfterPayment.current) {
+      return undefined;
+    }
+
+    const token = import.meta.env.VITE_FRUITFY_API_TOKEN as string | undefined;
+    const storeId = import.meta.env.VITE_FRUITFY_STORE_ID as string | undefined;
+    if (!token || !storeId) {
+      return undefined;
+    }
+
+    const postPaymentUrl =
+      ((import.meta.env.VITE_POST_PAYMENT_REDIRECT_URL as string) || '').trim() || DEFAULT_POST_PAYMENT_URL;
+
+    let isCancelled = false;
+    let inFlight = false;
+    let intervalId: number | undefined;
+
+    const mergeTrackingParams = (): URLSearchParams => {
+      const params = new URLSearchParams();
+      const cur = new URLSearchParams(window.location.search);
+      cur.forEach((v, k) => params.set(k, v));
+      const saved = trackingQueryString.trim();
+      if (saved) {
+        const s = new URLSearchParams(saved.startsWith('?') ? saved.slice(1) : saved);
+        s.forEach((v, k) => {
+          if (!params.has(k)) params.set(k, v);
+        });
+      }
+      return params;
+    };
+
+    const checkOrderStatus = async () => {
+      if (isCancelled || hasRedirectedAfterPayment.current || inFlight) return;
+      inFlight = true;
+      try {
+        const res = await fetch(
+          `https://api.fruitfy.io/api/order/${encodeURIComponent(pixOrderId)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Store-Id': storeId,
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+              'Accept-Language': 'pt_BR',
+            },
+          }
+        );
+        if (!res.ok) return;
+
+        const orderJson = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+        if (!isFruitfyOrderPaid(orderJson)) return;
+
+        hasRedirectedAfterPayment.current = true;
+        setPagamentoAprovadoRedirect(true);
+        if (intervalId !== undefined) window.clearInterval(intervalId);
+
+        window.setTimeout(() => {
+          if (isCancelled) return;
+          try {
+            const nextUrl = new URL(postPaymentUrl);
+            const params = mergeTrackingParams();
+            params.set('orderId', pixOrderId);
+            try {
+              params.set(
+                'prefill',
+                encodeUpsellCustomerPrefill({
+                  n: nome.trim(),
+                  e: email.trim(),
+                  p: normalizePhoneForUpsell(telefone),
+                  c: toDigits(cpf),
+                })
+              );
+            } catch {
+              /* segue só com orderId + UTMs */
+            }
+            nextUrl.search = params.toString();
+            window.location.href = nextUrl.toString();
+          } catch {
+            window.location.href = postPaymentUrl;
+          }
+        }, REDIRECT_AFTER_PAID_MS);
+      } catch (e) {
+        console.error('Erro ao consultar pedido Fruitfy:', e);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void checkOrderStatus();
+    intervalId = window.setInterval(() => {
+      void checkOrderStatus();
+    }, POLL_ORDER_MS) as unknown as number;
+
+    return () => {
+      isCancelled = true;
+      if (intervalId !== undefined) window.clearInterval(intervalId);
+    };
+  }, [pedidoConfirmado, pixOrderId, nome, email, telefone, cpf, trackingQueryString]);
+
   const handleCopyPixCode = async () => {
     if (!pixCode) return;
 
@@ -298,6 +471,9 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
     setApiSuccessMessage('');
     setPixCode('');
     setPedidoConfirmado(false);
+    setPixOrderId('');
+    setPagamentoAprovadoRedirect(false);
+    hasRedirectedAfterPayment.current = false;
 
     if (paymentMethod === 'card') {
       setShowCardError(true);
@@ -378,7 +554,8 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
           Authorization: `Bearer ${token}`,
           'Store-Id': storeId,
           'Content-Type': 'application/json',
-          Accept: 'application/json'
+          Accept: 'application/json',
+          'Accept-Language': 'pt_BR',
         },
         body: JSON.stringify(payload)
       });
@@ -392,6 +569,8 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
 
       setPedidoConfirmado(true);
       setApiSuccessMessage(result?.message || 'Cobrança PIX criada com sucesso.');
+      const oid = extractPixOrderIdFromFruitfy(result as Record<string, unknown>);
+      if (oid) setPixOrderId(oid);
       const findPixCode = (value: unknown): string => {
         if (typeof value === 'string') {
           return value.startsWith('000201') ? value : '';
@@ -497,12 +676,21 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
                 <div className="bg-[#0B2445] text-white p-5 text-center">
                   <p className="text-xs uppercase tracking-[0.18em] text-green-200 font-bold mb-1">Pagamento via PIX</p>
                   <h3 className="text-3xl leading-tight font-extrabold">
-                    Falta pouco, {firstName}
+                    {pagamentoAprovadoRedirect ? 'Pagamento aprovado!' : `Falta pouco, ${firstName}`}
                   </h3>
-                  <p className="text-sm text-green-100 mt-1">Finalize o pagamento para confirmar seu pedido.</p>
+                  <p className="text-sm text-green-100 mt-1">
+                    {pagamentoAprovadoRedirect
+                      ? 'Redirecionando para a próxima etapa...'
+                      : 'Finalize o pagamento para confirmar seu pedido.'}
+                  </p>
                 </div>
 
                 <div className="p-4 space-y-4">
+                  {pagamentoAprovadoRedirect && (
+                    <div className="rounded-xl border border-green-200 bg-green-50 text-green-900 p-3 text-sm font-semibold text-center">
+                      Tudo certo! Você será redirecionado em instantes.
+                    </div>
+                  )}
                   <div className="rounded-xl border border-gray-200 bg-[#F7FAF8] p-4">
                     <p className="text-sm font-bold text-[#0B2445] mb-2">PIX Copia e Cola (preview)</p>
                     <div className="rounded-lg bg-white border border-gray-200 p-3 text-[11px] text-gray-700 break-all mb-3">
@@ -975,12 +1163,6 @@ const CheckoutModal: React.FC<CheckoutModalProps> = ({ kit, onClose }) => {
                 {apiError}
               </div>
             )}
-
-            {pedidoConfirmado && (
-              <div className="rounded-xl border border-green-200 bg-green-50 text-green-900 p-4 text-sm font-semibold">
-                {apiSuccessMessage || 'Cobrança PIX criada com sucesso.'}
-              </div>
-            )}
               </>
             )}
           </div>
@@ -1167,7 +1349,9 @@ const App: React.FC = () => {
   };
 
   if (checkoutKit) {
-    return <CheckoutModal kit={checkoutKit} onClose={closeCheckout} />;
+    return (
+      <CheckoutModal kit={checkoutKit} onClose={closeCheckout} trackingQueryString={trackingSearch} />
+    );
   }
 
   if (currentPath === '/carrinho') {
