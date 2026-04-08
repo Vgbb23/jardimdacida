@@ -1551,7 +1551,7 @@ const App: React.FC = () => {
             <div className="aspect-video bg-black rounded-3xl overflow-hidden shadow-2xl relative border-4 border-white">
               <iframe 
                 className="absolute inset-0 w-full h-full"
-                src="https://www.youtube.com/embed/85xBlUQ-7l0?rel=0&modestbranding=1"
+                src="https://www.youtube.com/embed/zgyuTyN4NwY?rel=0&modestbranding=1"
                 title="40 Anos Cultivando Beleza"
                 frameBorder="0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
